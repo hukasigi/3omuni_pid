@@ -33,7 +33,7 @@ const double W1_ANGLE = 0.;
 const double W2_ANGLE = 120.;
 const double W3_ANGLE = 240.;
 
-constexpr double COUNTS_PER_MM = (ENC_RESOLUTION * GEAR_RATIO) / (PI * OD_RADIUS * 2);
+const double COUNTS_PER_MM = (ENC_RESOLUTION * GEAR_RATIO) / (PI * OD_RADIUS * 2);
 
 ESP32Encoder enc1, enc2, enc3;
 
@@ -45,14 +45,19 @@ const double MAX_OMEGA_CMD_RAD_S = 2.0; // 角速度上限[rad/s]
 PositionPid x_pos_pid(0.7, 1., 0.0, -MAX_VX_CMD_MM_S, MAX_VX_CMD_MM_S, -INTEGRAL_MAX, INTEGRAL_MAX);
 PositionPid y_pos_pid(0.7, 1., 0.0, -MAX_VY_CMD_MM_S, MAX_VY_CMD_MM_S, -INTEGRAL_MAX, INTEGRAL_MAX);
 PositionPid theta_pos_pid(0.7, 1., 0.0, -MAX_OMEGA_CMD_RAD_S, MAX_OMEGA_CMD_RAD_S, -INTEGRAL_MAX, INTEGRAL_MAX);
-
-Position targetPos{0, 0, 0};
-
 struct Position {
         double x;
         double y;
         double theta;
 };
+
+Position targetPos{0, 0, 0};
+
+// 受信共有バッファとロック（追加）
+portMUX_TYPE     targetMux     = portMUX_INITIALIZER_UNLOCKED;
+volatile int16_t rx_x_mm       = 0;
+volatile int16_t rx_y_mm       = 0;
+volatile int16_t rx_theta_mrad = 0;
 
 double WrapPi(double rad) {
     while (rad > PI)
@@ -154,9 +159,9 @@ class Odometry {
         static constexpr uint8_t PIN_ROTARY_A_3 = 27;
         static constexpr uint8_t PIN_ROTARY_B_3 = 14;
 
-        static constexpr int8_t ENCODER_SIGN_1 = -1;
-        static constexpr int8_t ENCODER_SIGN_2 = -1;
-        static constexpr int8_t ENCODER_SIGN_3 = -1;
+        static constexpr int8_t ENCODER_SIGN_1 = 1;
+        static constexpr int8_t ENCODER_SIGN_2 = 1;
+        static constexpr int8_t ENCODER_SIGN_3 = 1;
 
         ESP32Encoder& enc1_;
         ESP32Encoder& enc2_;
@@ -206,7 +211,8 @@ class Odometry {
             const double c2 = cos(a2), sn2 = sin(a2);
             const double c3 = cos(a3), sn3 = sin(a3);
 
-            const double k = ROBOT_TO_ODO_RADIUS;
+            // 回転寄与の符号を working code に合わせる
+            const double k = -ROBOT_TO_ODO_RADIUS;
 
             const double A[3][3] = {
                 {c1, sn1, k},
@@ -279,23 +285,134 @@ class OmniWheels {
         OmniWheel& w3_;
 };
 
+class EspNowSend {
+    public:
+        void begin() {
+            WiFi.mode(WIFI_STA);
+            WiFi.disconnect();
+
+            if (esp_now_init() == ESP_OK) {
+                Serial.println("ESPNow Init Success");
+            } else {
+                Serial.println("ESPNow Init Failed");
+                ESP.restart();
+            }
+
+            memset(&slave, 0, sizeof(slave));
+
+            uint8_t peerAddress[] = {0x08, 0xD1, 0xF9, 0x37, 0x41, 0xF0};
+            memcpy(slave.peer_addr, peerAddress, 6);
+
+            // チャンネル指定(0はチャンネル自動)
+            slave.channel = 0;
+            // 暗号化しない
+            slave.encrypt = false;
+
+            esp_err_t addStatus = esp_now_add_peer(&slave);
+            if (addStatus == ESP_OK) {
+                // Pair success
+                Serial.println("Pair success");
+            }
+
+            esp_now_register_send_cb(OnDataSent);
+            esp_now_register_recv_cb(OnDataRecv);
+        }
+        // esp_err_t send(int16_t send_x_mm, int16_t send_y_mm, int16_t send_theta_mrad, int16_t send_w1_t, int16_t send_w2_t,
+        //                int16_t send_w3_t, int16_t send_pwm1, int16_t send_pwm2, int16_t send_pwm3) {
+        esp_err_t send(int16_t send_x_mm, int16_t send_y_mm, int16_t send_theta_mrad) {
+            uint8_t data[] = {
+                (uint8_t)((send_x_mm >> 8) & 0xFF),       (uint8_t)(send_x_mm & 0xFF),
+                (uint8_t)((send_y_mm >> 8) & 0xFF),       (uint8_t)(send_y_mm & 0xFF),
+                (uint8_t)((send_theta_mrad >> 8) & 0xFF), (uint8_t)(send_theta_mrad & 0xFF),
+                // (uint8_t)((send_w1_t >> 8) & 0xFF),       (uint8_t)(send_w1_t & 0xFF),
+                // (uint8_t)((send_w2_t >> 8) & 0xFF),       (uint8_t)(send_w2_t & 0xFF),
+                // (uint8_t)((send_w3_t >> 8) & 0xFF),       (uint8_t)(send_w3_t & 0xFF),
+                // (uint8_t)((send_pwm1 >> 8) & 0xFF),       (uint8_t)(send_pwm1 & 0xFF),
+                // (uint8_t)((send_pwm2 >> 8) & 0xFF),       (uint8_t)(send_pwm2 & 0xFF),
+                // (uint8_t)((send_pwm3 >> 8) & 0xFF),       (uint8_t)(send_pwm3 & 0xFF),
+            };
+            esp_err_t result = esp_now_send(slave.peer_addr, data, sizeof(data));
+            return result;
+        }
+
+    private:
+        esp_now_peer_info_t slave;
+
+        static void OnDataSent(const uint8_t* mac_addr, esp_now_send_status_t status) {}
+
+        static void OnDataRecv(const uint8_t* mac_addr, const uint8_t* data, int data_len) {
+            if (data_len < 6) return;
+
+            // uint8_t を uint16_t に昇格してからシフトして符号拡張を防ぐ
+            int16_t tx = (int16_t)(((uint16_t)data[0] << 8) | (uint16_t)data[1]);
+            int16_t ty = (int16_t)(((uint16_t)data[2] << 8) | (uint16_t)data[3]);
+            int16_t tt = (int16_t)(((uint16_t)data[4] << 8) | (uint16_t)data[5]);
+
+            portENTER_CRITICAL(&targetMux);
+            rx_x_mm       = tx;
+            rx_y_mm       = ty;
+            rx_theta_mrad = tt;
+            portEXIT_CRITICAL(&targetMux);
+        }
+};
+
 class Robot {
     public:
-        Robot(OmniWheels& wheels, Odometry& odo) : omni_wheels(wheels), odometry(odo) {}
+        Robot(OmniWheels& wheels, Odometry& odo, EspNowSend& esp_now) : omni_wheels(wheels), odometry(odo), esp_now(esp_now) {}
 
         void set_target(Position position) { target = position; }
 
         void update(double dt) {
+            int16_t cx, cy, cth;
+            portENTER_CRITICAL(&targetMux);
+            cx  = rx_x_mm;
+            cy  = rx_y_mm;
+            cth = rx_theta_mrad;
+            portEXIT_CRITICAL(&targetMux);
+
+            target.x     = (double)cx;
+            target.y     = (double)cy;
+            target.theta = WrapPi((double)cth / 1000.0);
+
             const Position nowPos = odometry.get_position();
 
-            const double vx_world = x_pos_pid.update(target.x, nowPos.x, dt);
-            const double vy_world = y_pos_pid.update(target.y, nowPos.y, dt);
-            const double omega    = theta_pos_pid.update(target.theta, nowPos.theta, dt);
+            const double ex       = target.x - nowPos.x;
+            const double ey       = target.y - nowPos.y;
+            const double dist_err = hypot(ex, ey);
+            const double th_err   = WrapPi(target.theta - nowPos.theta);
+
+            double vx_world = 0;
+            double vy_world = 0;
+            double omega    = 0;
+
+            const bool in_deadzone = (dist_err < POS_DEADZONE_MM) && (fabs(th_err) < THETA_DEADZONE_RAD);
+
+            if (!in_deadzone) {
+                vx_world = x_pos_pid.update(target.x, nowPos.x, dt);
+                vy_world = y_pos_pid.update(target.y, nowPos.y, dt);
+                omega    = theta_pos_pid.update(target.theta, nowPos.theta, dt);
+            } else {
+                x_pos_pid.reset();
+                y_pos_pid.reset();
+                theta_pos_pid.reset();
+            }
 
             const double ct      = cos(nowPos.theta);
             const double st      = sin(nowPos.theta);
             const double vx_body = ct * vx_world + st * vy_world;
             const double vy_body = -st * vx_world + ct * vy_world;
+
+            static unsigned long last_send_ms = 0;
+            unsigned long        ms           = millis();
+            if ((long)(ms - last_send_ms) >= 100) {
+                last_send_ms = ms;
+                esp_err_t res =
+                    esp_now.send((int16_t)lround(nowPos.x), (int16_t)lround(nowPos.y), (int16_t)lround(nowPos.theta * 1000.0));
+                if (res != ESP_OK) {
+                    // 必要ならログ
+                    Serial.printf("esp_now_send err=%d\n", res);
+                }
+            }
 
             omni_wheels.move(vx_body, vy_body, omega);
         }
@@ -303,28 +420,16 @@ class Robot {
     private:
         OmniWheels& omni_wheels;
         Odometry&   odometry;
+        EspNowSend& esp_now;
         Position    target{0., 0., 0.};
 
         double x_control     = 0;
         double y_control     = 0;
         double theta_control = 0;
+
+        const double POS_DEADZONE_MM    = 5.0;               // 変更: 10->5 mm
+        const double THETA_DEADZONE_RAD = 3.0 * PI / 180.0;  // 変更: 10deg->3deg
 };
-
-esp_now_peer_info_t slave;
-
-void OnDataSent(const uint8_t* mac_addr, esp_now_send_status_t status) {}
-
-void OnDataRecv(const uint8_t* mac_addr, const uint8_t* data, int data_len) {
-    if (data_len < 6) return;
-
-    int16_t tx = (int16_t)((data[0] << 8) | data[1]);
-    int16_t ty = (int16_t)((data[2] << 8) | data[3]);
-    int16_t tt = (int16_t)((data[4] << 8) | data[5]);
-
-    targetPos.x     = (double)tx;
-    targetPos.y     = (double)ty;
-    targetPos.theta = (double)tt;
-}
 
 Motor m1(PIN_DIR_1, PIN_PWM_1, W1_CH, W1_SIGN);
 Motor m2(PIN_DIR_2, PIN_PWM_2, W2_CH, W2_SIGN);
@@ -337,7 +442,10 @@ OmniWheel w2(m2, W2_ANGLE);
 OmniWheel w3(m3, W3_ANGLE);
 
 OmniWheels omuni(w1, w2, w3);
-Robot      robot(omuni, odometry);
+
+EspNowSend esp_now;
+
+Robot robot(omuni, odometry, esp_now);
 
 constexpr long US_CONTROL_CYCLE = 5000;
 
@@ -349,35 +457,7 @@ void setup() {
     m2.begin();
     m3.begin();
     odometry.begin();
-
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
-
-    if (esp_now_init() == ESP_OK) {
-        Serial.println("ESPNow Init Success");
-    } else {
-        Serial.println("ESPNow Init Failed");
-        ESP.restart();
-    }
-
-    memset(&slave, 0, sizeof(slave));
-
-    uint8_t peerAddress[] = {0x08, 0xD1, 0xF9, 0x37, 0x41, 0xF0};
-    memcpy(slave.peer_addr, peerAddress, 6);
-
-    // チャンネル指定(0はチャンネル自動)
-    slave.channel = 0;
-    // 暗号化しない
-    slave.encrypt = false;
-
-    esp_err_t addStatus = esp_now_add_peer(&slave);
-    if (addStatus == ESP_OK) {
-        // Pair success
-        Serial.println("Pair success");
-    }
-
-    esp_now_register_send_cb(OnDataSent);
-    esp_now_register_recv_cb(OnDataRecv);
+    esp_now.begin();
 
     last = micros();
 }
@@ -390,8 +470,5 @@ void loop() {
     last      = now;
 
     odometry.update();
-
-    robot.set_target(targetPos);
-
     robot.update(dt);
 }
