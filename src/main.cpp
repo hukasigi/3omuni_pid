@@ -1,4 +1,5 @@
 #include "PositionPID.h"
+#include "SpeedPID.h"
 #include <Arduino.h>
 #include <ESP32Encoder.h>
 #include <PS4Controller.h>
@@ -37,14 +38,20 @@ const double COUNTS_PER_MM = (ENC_RESOLUTION * GEAR_RATIO) / (PI * OD_RADIUS * 2
 
 ESP32Encoder enc1, enc2, enc3;
 
-const double MAX_VX_CMD_MM_S     = 200.0;
-const double MAX_VY_CMD_MM_S     = 200.0;
-const double INTEGRAL_MAX        = 10.0;
-const double MAX_OMEGA_CMD_RAD_S = 2.0; // 角速度上限[rad/s]
+const double      MAX_VX_CMD_MM_S     = 200.0;
+const double      MAX_VY_CMD_MM_S     = 200.0;
+constexpr int16_t PWM_LIMIT           = 255;
+const double      INTEGRAL_MAX        = 10.0;
+const double      MAX_OMEGA_CMD_RAD_S = 2.0; // 角速度上限[rad/s]
 
-PositionPid x_pos_pid(0.7, 1., 0.0, -MAX_VX_CMD_MM_S, MAX_VX_CMD_MM_S, -INTEGRAL_MAX, INTEGRAL_MAX);
-PositionPid y_pos_pid(0.7, 1., 0.0, -MAX_VY_CMD_MM_S, MAX_VY_CMD_MM_S, -INTEGRAL_MAX, INTEGRAL_MAX);
-PositionPid theta_pos_pid(0.7, 1., 0.0, -MAX_OMEGA_CMD_RAD_S, MAX_OMEGA_CMD_RAD_S, -INTEGRAL_MAX, INTEGRAL_MAX);
+PositionPid x_pos_pid(2., 0., 0.0, -MAX_VX_CMD_MM_S, MAX_VX_CMD_MM_S, -INTEGRAL_MAX, INTEGRAL_MAX);
+PositionPid y_pos_pid(2., 0., 0.0, -MAX_VY_CMD_MM_S, MAX_VY_CMD_MM_S, -INTEGRAL_MAX, INTEGRAL_MAX);
+PositionPid theta_pos_pid(2., 0., 0.0, -MAX_OMEGA_CMD_RAD_S, MAX_OMEGA_CMD_RAD_S, -INTEGRAL_MAX, INTEGRAL_MAX);
+
+SpeedPID x_speed_pid(0.7, 0.0, 0.0, -MAX_VX_CMD_MM_S, MAX_VX_CMD_MM_S);
+SpeedPID y_speed_pid(0.7, 0.0, 0.0, -MAX_VY_CMD_MM_S, MAX_VY_CMD_MM_S);
+SpeedPID theta_speed_pid(0.7, 0.0, 0.0, -MAX_OMEGA_CMD_RAD_S, MAX_OMEGA_CMD_RAD_S);
+
 struct Position {
         double x;
         double y;
@@ -53,7 +60,7 @@ struct Position {
 
 Position targetPos{0, 0, 0};
 
-// 受信共有バッファとロック（追加）
+// 受信共有バッファとロック
 portMUX_TYPE     targetMux     = portMUX_INITIALIZER_UNLOCKED;
 volatile int16_t rx_x_mm       = 0;
 volatile int16_t rx_y_mm       = 0;
@@ -122,7 +129,7 @@ class Odometry {
             buildInverse_();
         }
 
-        void update() {
+        void update(double dt) {
             if (!inv_ok_) buildInverse_();
             if (!inv_ok_) return;
 
@@ -140,6 +147,10 @@ class Odometry {
 
             const Position dpos = CountToBody(dc1, dc2, dc3);
 
+            vel_.x     = dpos.x / dt;
+            vel_.y     = dpos.y / dt;
+            vel_.theta = dpos.theta / dt;
+
             const double th_mid = pos_.theta + 0.5 * dpos.theta;
             const double ct_mid = cos(th_mid);
             const double st_mid = sin(th_mid);
@@ -150,18 +161,19 @@ class Odometry {
         }
 
         Position get_position() const { return pos_; }
+        Position get_velocity() const { return vel_; }
 
     private:
-        static constexpr uint8_t PIN_ROTARY_A_1 = 25;
-        static constexpr uint8_t PIN_ROTARY_B_1 = 26;
-        static constexpr uint8_t PIN_ROTARY_A_2 = 32;
-        static constexpr uint8_t PIN_ROTARY_B_2 = 33;
-        static constexpr uint8_t PIN_ROTARY_A_3 = 27;
-        static constexpr uint8_t PIN_ROTARY_B_3 = 14;
+        static const uint8_t PIN_ROTARY_A_1 = 25;
+        static const uint8_t PIN_ROTARY_B_1 = 26;
+        static const uint8_t PIN_ROTARY_A_2 = 32;
+        static const uint8_t PIN_ROTARY_B_2 = 33;
+        static const uint8_t PIN_ROTARY_A_3 = 27;
+        static const uint8_t PIN_ROTARY_B_3 = 14;
 
-        static constexpr int8_t ENCODER_SIGN_1 = 1;
-        static constexpr int8_t ENCODER_SIGN_2 = 1;
-        static constexpr int8_t ENCODER_SIGN_3 = 1;
+        static const int8_t ENCODER_SIGN_1 = 1;
+        static const int8_t ENCODER_SIGN_2 = 1;
+        static const int8_t ENCODER_SIGN_3 = 1;
 
         ESP32Encoder& enc1_;
         ESP32Encoder& enc2_;
@@ -172,6 +184,7 @@ class Odometry {
         long prev_count3_{0};
 
         Position pos_{0., 0., 0.};
+        Position vel_{0., 0., 0.};
 
         bool   inv_ok_{false};
         double invA_[3][3]{};
@@ -246,7 +259,7 @@ class OmniWheel {
         OmniWheel(Motor& motor, double angle, double pwm_gain = 1.0)
             : motor_(motor), angle_(angle / 180 * PI), gain_(pwm_gain) {}
 
-        void run(double vx_mm_s, double vy_mm_s, double omega_rad_s) {
+        void run(double vx_mm_s, double vy_mm_s, double omega_rad_s, double dt_s) {
             const double u_mm_s = cos(angle_) * vx_mm_s + sin(angle_) * vy_mm_s + ROBOT_TO_WHEEL_RADIUS * omega_rad_s;
 
             const int pwm = (int)lround(u_mm_s * gain_);
@@ -264,19 +277,10 @@ class OmniWheels {
     public:
         OmniWheels(OmniWheel& w1, OmniWheel& w2, OmniWheel& w3) : w1_(w1), w2_(w2), w3_(w3) {}
 
-        void moveDelta(double dx_mm, double dy_mm, double dtheta_rad, double dt_s) {
-            if (dt_s <= 0.0) return;
-            double dx_mm_s      = dx_mm / dt_s;
-            double dy_mm_s      = dy_mm / dt_s;
-            double dtheta_rad_s = dtheta_rad / dt_s;
-
-            move(dx_mm_s, dy_mm_s, dtheta_rad_s);
-        }
-
-        void move(double vx_mm_s, double vy_mm_s, double omega_rad_s) {
-            w1_.run(vx_mm_s, vy_mm_s, omega_rad_s);
-            w2_.run(vx_mm_s, vy_mm_s, omega_rad_s);
-            w3_.run(vx_mm_s, vy_mm_s, omega_rad_s);
+        void move(double vx_mm_s, double vy_mm_s, double omega_rad_s, double dt_s) {
+            w1_.run(vx_mm_s, vy_mm_s, omega_rad_s, dt_s);
+            w2_.run(vx_mm_s, vy_mm_s, omega_rad_s, dt_s);
+            w3_.run(vx_mm_s, vy_mm_s, omega_rad_s, dt_s);
         }
 
     private:
@@ -375,11 +379,16 @@ class Robot {
             target.theta = WrapPi((double)cth / 1000.0);
 
             const Position nowPos = odometry.get_position();
+            const Position nowVel = odometry.get_velocity();
 
             const double ex       = target.x - nowPos.x;
             const double ey       = target.y - nowPos.y;
             const double dist_err = hypot(ex, ey);
             const double th_err   = WrapPi(target.theta - nowPos.theta);
+
+            double vx_target    = 0;
+            double vy_target    = 0;
+            double omega_target = 0;
 
             double vx_world = 0;
             double vy_world = 0;
@@ -387,14 +396,22 @@ class Robot {
 
             const bool in_deadzone = (dist_err < POS_DEADZONE_MM) && (fabs(th_err) < THETA_DEADZONE_RAD);
 
-            if (!in_deadzone) {
-                vx_world = x_pos_pid.update(target.x, nowPos.x, dt);
-                vy_world = y_pos_pid.update(target.y, nowPos.y, dt);
-                omega    = theta_pos_pid.update(target.theta, nowPos.theta, dt);
-            } else {
+            if (in_deadzone) {
                 x_pos_pid.reset();
                 y_pos_pid.reset();
                 theta_pos_pid.reset();
+                x_speed_pid.reset();
+                y_speed_pid.reset();
+                theta_speed_pid.reset();
+
+            } else {
+                vx_target    = x_pos_pid.update(target.x, nowPos.x, dt);
+                vy_target    = y_pos_pid.update(target.y, nowPos.y, dt);
+                omega_target = theta_pos_pid.update(target.theta, nowPos.theta, dt);
+
+                vx_world = x_speed_pid.update(vx_target, nowVel.x, dt);
+                vy_world = y_speed_pid.update(vy_target, nowVel.y, dt);
+                omega    = theta_speed_pid.update(omega_target, nowVel.theta, dt);
             }
 
             const double ct      = cos(nowPos.theta);
@@ -409,12 +426,11 @@ class Robot {
                 esp_err_t res =
                     esp_now.send((int16_t)lround(nowPos.x), (int16_t)lround(nowPos.y), (int16_t)lround(nowPos.theta * 1000.0));
                 if (res != ESP_OK) {
-                    // 必要ならログ
                     Serial.printf("esp_now_send err=%d\n", res);
                 }
             }
 
-            omni_wheels.move(vx_body, vy_body, omega);
+            omni_wheels.move(vx_body, vy_body, omega, dt);
         }
 
     private:
@@ -427,8 +443,8 @@ class Robot {
         double y_control     = 0;
         double theta_control = 0;
 
-        const double POS_DEADZONE_MM    = 5.0;               // 変更: 10->5 mm
-        const double THETA_DEADZONE_RAD = 3.0 * PI / 180.0;  // 変更: 10deg->3deg
+        const double POS_DEADZONE_MM    = 5.0;
+        const double THETA_DEADZONE_RAD = 3.0 * PI / 180.0;
 };
 
 Motor m1(PIN_DIR_1, PIN_PWM_1, W1_CH, W1_SIGN);
@@ -469,6 +485,6 @@ void loop() {
     double dt = (now - last) * 1.e-6;
     last      = now;
 
-    odometry.update();
+    odometry.update(dt);
     robot.update(dt);
 }
