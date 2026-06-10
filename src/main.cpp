@@ -44,13 +44,17 @@ constexpr int16_t PWM_LIMIT           = 255;
 const double      INTEGRAL_MAX        = 10.0;
 const double      MAX_OMEGA_CMD_RAD_S = 2.0; // 角速度上限[rad/s]
 
-PositionPid x_pos_pid(2., 0., 0.0, -MAX_VX_CMD_MM_S, MAX_VX_CMD_MM_S, -INTEGRAL_MAX, INTEGRAL_MAX);
-PositionPid y_pos_pid(2., 0., 0.0, -MAX_VY_CMD_MM_S, MAX_VY_CMD_MM_S, -INTEGRAL_MAX, INTEGRAL_MAX);
-PositionPid theta_pos_pid(2., 0., 0.0, -MAX_OMEGA_CMD_RAD_S, MAX_OMEGA_CMD_RAD_S, -INTEGRAL_MAX, INTEGRAL_MAX);
+PositionPid x_pos_pid(2.5, 0., 0.0, -MAX_VX_CMD_MM_S, MAX_VX_CMD_MM_S, -INTEGRAL_MAX, INTEGRAL_MAX);
+PositionPid y_pos_pid(2.5, 0., 0.0, -MAX_VY_CMD_MM_S, MAX_VY_CMD_MM_S, -INTEGRAL_MAX, INTEGRAL_MAX);
+PositionPid theta_pos_pid(2.5, 0., 0.0, -MAX_OMEGA_CMD_RAD_S, MAX_OMEGA_CMD_RAD_S, -INTEGRAL_MAX, INTEGRAL_MAX);
 
-SpeedPID x_speed_pid(0.7, 0.0, 0.0, -MAX_VX_CMD_MM_S, MAX_VX_CMD_MM_S);
-SpeedPID y_speed_pid(0.7, 0.0, 0.0, -MAX_VY_CMD_MM_S, MAX_VY_CMD_MM_S);
-SpeedPID theta_speed_pid(0.7, 0.0, 0.0, -MAX_OMEGA_CMD_RAD_S, MAX_OMEGA_CMD_RAD_S);
+// PositionPid x_speed_pid(0.5, 0., 0.0, -MAX_VX_CMD_MM_S, MAX_VX_CMD_MM_S, -INTEGRAL_MAX, INTEGRAL_MAX);
+// PositionPid y_speed_pid(0.5, 0., 0.0, -MAX_VY_CMD_MM_S, MAX_VY_CMD_MM_S, -INTEGRAL_MAX, INTEGRAL_MAX);
+// PositionPid theta_speed_pid(0.5, 0., 0.0, -MAX_OMEGA_CMD_RAD_S, MAX_OMEGA_CMD_RAD_S, -INTEGRAL_MAX, INTEGRAL_MAX);
+
+SpeedPID x_speed_pid(0.5, 0, 0.0, -MAX_VX_CMD_MM_S, MAX_VX_CMD_MM_S);
+SpeedPID y_speed_pid(0.5, 0, 0.0, -MAX_VY_CMD_MM_S, MAX_VY_CMD_MM_S);
+SpeedPID theta_speed_pid(0.5, 0, 0.0, -MAX_OMEGA_CMD_RAD_S, MAX_OMEGA_CMD_RAD_S);
 
 struct Position {
         double x;
@@ -102,7 +106,7 @@ class Motor {
         uint8_t              pinPwm_;
         uint8_t              pwmCh_;
         int8_t               direction_;
-        static const uint8_t PWM_DEADBAND = 8;
+        static const uint8_t PWM_DEADBAND = 0;
 };
 
 class Odometry {
@@ -158,6 +162,8 @@ class Odometry {
             pos_.x += ct_mid * dpos.x - st_mid * dpos.y;
             pos_.y += st_mid * dpos.x + ct_mid * dpos.y;
             pos_.theta = WrapPi(pos_.theta + dpos.theta);
+
+            Serial.printf("c1:%d c2:%d c3:%d\r\n", c1, c2, c3);
         }
 
         Position get_position() const { return pos_; }
@@ -259,7 +265,7 @@ class OmniWheel {
         OmniWheel(Motor& motor, double angle, double pwm_gain = 1.0)
             : motor_(motor), angle_(angle / 180 * PI), gain_(pwm_gain) {}
 
-        void run(double vx_mm_s, double vy_mm_s, double omega_rad_s, double dt_s) {
+        void run(double vx_mm_s, double vy_mm_s, double omega_rad_s) {
             const double u_mm_s = cos(angle_) * vx_mm_s + sin(angle_) * vy_mm_s + ROBOT_TO_WHEEL_RADIUS * omega_rad_s;
 
             const int pwm = (int)lround(u_mm_s * gain_);
@@ -277,10 +283,10 @@ class OmniWheels {
     public:
         OmniWheels(OmniWheel& w1, OmniWheel& w2, OmniWheel& w3) : w1_(w1), w2_(w2), w3_(w3) {}
 
-        void move(double vx_mm_s, double vy_mm_s, double omega_rad_s, double dt_s) {
-            w1_.run(vx_mm_s, vy_mm_s, omega_rad_s, dt_s);
-            w2_.run(vx_mm_s, vy_mm_s, omega_rad_s, dt_s);
-            w3_.run(vx_mm_s, vy_mm_s, omega_rad_s, dt_s);
+        void move(double vx_mm_s, double vy_mm_s, double omega_rad_s) {
+            w1_.run(vx_mm_s, vy_mm_s, omega_rad_s);
+            w2_.run(vx_mm_s, vy_mm_s, omega_rad_s);
+            w3_.run(vx_mm_s, vy_mm_s, omega_rad_s);
         }
 
     private:
@@ -381,6 +387,12 @@ class Robot {
             const Position nowPos = odometry.get_position();
             const Position nowVel = odometry.get_velocity();
 
+            // body -> world に変換して速度計測を一致させる
+            const double ct           = cos(nowPos.theta);
+            const double st           = sin(nowPos.theta);
+            const double now_vx_world = ct * nowVel.x - st * nowVel.y;
+            const double now_vy_world = st * nowVel.x + ct * nowVel.y;
+
             const double ex       = target.x - nowPos.x;
             const double ey       = target.y - nowPos.y;
             const double dist_err = hypot(ex, ey);
@@ -409,13 +421,11 @@ class Robot {
                 vy_target    = y_pos_pid.update(target.y, nowPos.y, dt);
                 omega_target = theta_pos_pid.update(target.theta, nowPos.theta, dt);
 
-                vx_world = x_speed_pid.update(vx_target, nowVel.x, dt);
-                vy_world = y_speed_pid.update(vy_target, nowVel.y, dt);
+                vx_world = x_speed_pid.update(vx_target, now_vx_world, dt);
+                vy_world = y_speed_pid.update(vy_target, now_vy_world, dt);
                 omega    = theta_speed_pid.update(omega_target, nowVel.theta, dt);
             }
 
-            const double ct      = cos(nowPos.theta);
-            const double st      = sin(nowPos.theta);
             const double vx_body = ct * vx_world + st * vy_world;
             const double vy_body = -st * vx_world + ct * vy_world;
 
@@ -428,9 +438,12 @@ class Robot {
                 if (res != ESP_OK) {
                     Serial.printf("esp_now_send err=%d\n", res);
                 }
+                // Serial.printf("x:%f y:%f th:%f x_t%f y_t%f omega_t%f\r\n", nowPos.x, nowPos.y, nowPos.theta, vx_world,
+                // vy_world,
+                //               omega);
             }
 
-            omni_wheels.move(vx_body, vy_body, omega, dt);
+            omni_wheels.move(vx_body, vy_body, omega);
         }
 
     private:
@@ -439,12 +452,8 @@ class Robot {
         EspNowSend& esp_now;
         Position    target{0., 0., 0.};
 
-        double x_control     = 0;
-        double y_control     = 0;
-        double theta_control = 0;
-
-        const double POS_DEADZONE_MM    = 5.0;
-        const double THETA_DEADZONE_RAD = 3.0 * PI / 180.0;
+        const double POS_DEADZONE_MM    = 1.0;
+        const double THETA_DEADZONE_RAD = 2.0 * PI / 180.0;
 };
 
 Motor m1(PIN_DIR_1, PIN_PWM_1, W1_CH, W1_SIGN);
