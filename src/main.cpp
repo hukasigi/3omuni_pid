@@ -44,22 +44,28 @@ constexpr int16_t PWM_LIMIT           = 255;
 const double      INTEGRAL_MAX        = 10.0;
 const double      MAX_OMEGA_CMD_RAD_S = 2.0; // 角速度上限[rad/s]
 
-PositionPid x_pos_pid(2.5, 0., 0.0, -MAX_VX_CMD_MM_S, MAX_VX_CMD_MM_S, -INTEGRAL_MAX, INTEGRAL_MAX);
-PositionPid y_pos_pid(2.5, 0., 0.0, -MAX_VY_CMD_MM_S, MAX_VY_CMD_MM_S, -INTEGRAL_MAX, INTEGRAL_MAX);
-PositionPid theta_pos_pid(2.5, 0., 0.0, -MAX_OMEGA_CMD_RAD_S, MAX_OMEGA_CMD_RAD_S, -INTEGRAL_MAX, INTEGRAL_MAX);
+PositionPid x_pos_pid(2., 0., 0.0, -MAX_VX_CMD_MM_S, MAX_VX_CMD_MM_S, -INTEGRAL_MAX, INTEGRAL_MAX);
+PositionPid y_pos_pid(2., 0., 0.0, -MAX_VY_CMD_MM_S, MAX_VY_CMD_MM_S, -INTEGRAL_MAX, INTEGRAL_MAX);
+PositionPid theta_pos_pid(2., 0., 0.0, -MAX_OMEGA_CMD_RAD_S, MAX_OMEGA_CMD_RAD_S, -INTEGRAL_MAX, INTEGRAL_MAX);
 
-// PositionPid x_speed_pid(0.5, 0., 0.0, -MAX_VX_CMD_MM_S, MAX_VX_CMD_MM_S, -INTEGRAL_MAX, INTEGRAL_MAX);
-// PositionPid y_speed_pid(0.5, 0., 0.0, -MAX_VY_CMD_MM_S, MAX_VY_CMD_MM_S, -INTEGRAL_MAX, INTEGRAL_MAX);
-// PositionPid theta_speed_pid(0.5, 0., 0.0, -MAX_OMEGA_CMD_RAD_S, MAX_OMEGA_CMD_RAD_S, -INTEGRAL_MAX, INTEGRAL_MAX);
+PositionPid x_speed_pid(0.5, 0.2, 0.0, -PWM_LIMIT, PWM_LIMIT, -INTEGRAL_MAX, INTEGRAL_MAX);
+PositionPid y_speed_pid(0.5, 0.2, 0.0, -PWM_LIMIT, PWM_LIMIT, -INTEGRAL_MAX, INTEGRAL_MAX);
+PositionPid theta_speed_pid(0.5, 0.2, 0.0, -PWM_LIMIT, PWM_LIMIT, -INTEGRAL_MAX, INTEGRAL_MAX);
 
-SpeedPID x_speed_pid(0.5, 0, 0.0, -MAX_VX_CMD_MM_S, MAX_VX_CMD_MM_S);
-SpeedPID y_speed_pid(0.5, 0, 0.0, -MAX_VY_CMD_MM_S, MAX_VY_CMD_MM_S);
-SpeedPID theta_speed_pid(0.5, 0, 0.0, -MAX_OMEGA_CMD_RAD_S, MAX_OMEGA_CMD_RAD_S);
+// SpeedPID x_speed_pid(0.5, 0.5, 0.0, -MAX_VX_CMD_MM_S, MAX_VX_CMD_MM_S);
+// SpeedPID y_speed_pid(0.5, 0.5, 0.0, -MAX_VY_CMD_MM_S, MAX_VY_CMD_MM_S);
+// SpeedPID theta_speed_pid(0.5, 0.5, 0.0, -MAX_OMEGA_CMD_RAD_S, MAX_OMEGA_CMD_RAD_S);
 
 struct Position {
         double x;
         double y;
         double theta;
+};
+
+struct pwm {
+        int16_t m1;
+        int16_t m2;
+        int16_t m3;
 };
 
 Position targetPos{0, 0, 0};
@@ -92,13 +98,21 @@ class Motor {
 
         void Write(int16_t pwm_signed) {
             int duty = direction_ * pwm_signed;
+
             if (abs(duty) < PWM_DEADBAND) {
                 ledcWrite(pwmCh_, 0);
+                last_dir_ = 0;
                 return;
             }
-            duty = constrain(duty, -255, 255);
-            digitalWrite(pinDir_, (duty > 0) ? HIGH : LOW);
-            ledcWrite(pwmCh_, abs(duty));
+
+            int new_dir = (duty > 0) ? 1 : -1;
+            if (new_dir != last_dir_) {
+                digitalWrite(pinDir_, (new_dir > 0) ? HIGH : LOW);
+                last_dir_ = new_dir;
+            }
+
+            int out = constrain(abs(duty), 0, 255);
+            ledcWrite(pwmCh_, out);
         }
 
     private:
@@ -106,7 +120,8 @@ class Motor {
         uint8_t              pinPwm_;
         uint8_t              pwmCh_;
         int8_t               direction_;
-        static const uint8_t PWM_DEADBAND = 0;
+        int8_t               last_dir_{0};
+        static const uint8_t PWM_DEADBAND = 8;
 };
 
 class Odometry {
@@ -163,7 +178,7 @@ class Odometry {
             pos_.y += st_mid * dpos.x + ct_mid * dpos.y;
             pos_.theta = WrapPi(pos_.theta + dpos.theta);
 
-            Serial.printf("c1:%d c2:%d c3:%d\r\n", c1, c2, c3);
+            // Serial.printf("c1:%d c2:%d c3:%d\r\n", c1, c2, c3);
         }
 
         Position get_position() const { return pos_; }
@@ -265,34 +280,39 @@ class OmniWheel {
         OmniWheel(Motor& motor, double angle, double pwm_gain = 1.0)
             : motor_(motor), angle_(angle / 180 * PI), gain_(pwm_gain) {}
 
-        void run(double vx_mm_s, double vy_mm_s, double omega_rad_s) {
+        int16_t run(double vx_mm_s, double vy_mm_s, double omega_rad_s) {
             const double u_mm_s = cos(angle_) * vx_mm_s + sin(angle_) * vy_mm_s + ROBOT_TO_WHEEL_RADIUS * omega_rad_s;
 
-            const int pwm = (int)lround(u_mm_s * gain_);
-            motor_.Write((int16_t)constrain(pwm, -PWM_LIMIT, PWM_LIMIT));
+            const int pwm_raw = (int)lround(u_mm_s * gain_);
+            int16_t   pwm     = constrain(pwm_raw, -PWM_LIMIT, PWM_LIMIT);
+            motor_.Write(pwm);
+            return pwm;
         }
 
     private:
         Motor&                   motor_;
         double                   angle_{0.0};
         double                   gain_{1.0};
-        static constexpr int16_t PWM_LIMIT = 200;
+        static constexpr int16_t PWM_LIMIT = 255;
 };
 
 class OmniWheels {
     public:
         OmniWheels(OmniWheel& w1, OmniWheel& w2, OmniWheel& w3) : w1_(w1), w2_(w2), w3_(w3) {}
 
-        void move(double vx_mm_s, double vy_mm_s, double omega_rad_s) {
-            w1_.run(vx_mm_s, vy_mm_s, omega_rad_s);
-            w2_.run(vx_mm_s, vy_mm_s, omega_rad_s);
-            w3_.run(vx_mm_s, vy_mm_s, omega_rad_s);
+        pwm move(double vx_mm_s, double vy_mm_s, double omega_rad_s) {
+            pwm_out_.m1 = w1_.run(vx_mm_s, vy_mm_s, omega_rad_s);
+            pwm_out_.m2 = w2_.run(vx_mm_s, vy_mm_s, omega_rad_s);
+            pwm_out_.m3 = w3_.run(vx_mm_s, vy_mm_s, omega_rad_s);
+
+            return pwm_out_;
         }
 
     private:
         OmniWheel& w1_;
         OmniWheel& w2_;
         OmniWheel& w3_;
+        pwm        pwm_out_{0, 0, 0};
 };
 
 class EspNowSend {
@@ -327,19 +347,16 @@ class EspNowSend {
             esp_now_register_send_cb(OnDataSent);
             esp_now_register_recv_cb(OnDataRecv);
         }
-        // esp_err_t send(int16_t send_x_mm, int16_t send_y_mm, int16_t send_theta_mrad, int16_t send_w1_t, int16_t send_w2_t,
-        //                int16_t send_w3_t, int16_t send_pwm1, int16_t send_pwm2, int16_t send_pwm3) {
-        esp_err_t send(int16_t send_x_mm, int16_t send_y_mm, int16_t send_theta_mrad) {
+        esp_err_t send(int16_t send_x_mm, int16_t send_y_mm, int16_t send_theta_mrad, int16_t send_pwm1, int16_t send_pwm2,
+                       int16_t send_pwm3) {
+            // esp_err_t send(int16_t send_x_mm, int16_t send_y_mm, int16_t send_theta_mrad) {
             uint8_t data[] = {
                 (uint8_t)((send_x_mm >> 8) & 0xFF),       (uint8_t)(send_x_mm & 0xFF),
                 (uint8_t)((send_y_mm >> 8) & 0xFF),       (uint8_t)(send_y_mm & 0xFF),
                 (uint8_t)((send_theta_mrad >> 8) & 0xFF), (uint8_t)(send_theta_mrad & 0xFF),
-                // (uint8_t)((send_w1_t >> 8) & 0xFF),       (uint8_t)(send_w1_t & 0xFF),
-                // (uint8_t)((send_w2_t >> 8) & 0xFF),       (uint8_t)(send_w2_t & 0xFF),
-                // (uint8_t)((send_w3_t >> 8) & 0xFF),       (uint8_t)(send_w3_t & 0xFF),
-                // (uint8_t)((send_pwm1 >> 8) & 0xFF),       (uint8_t)(send_pwm1 & 0xFF),
-                // (uint8_t)((send_pwm2 >> 8) & 0xFF),       (uint8_t)(send_pwm2 & 0xFF),
-                // (uint8_t)((send_pwm3 >> 8) & 0xFF),       (uint8_t)(send_pwm3 & 0xFF),
+                (uint8_t)((send_pwm1 >> 8) & 0xFF),       (uint8_t)(send_pwm1 & 0xFF),
+                (uint8_t)((send_pwm2 >> 8) & 0xFF),       (uint8_t)(send_pwm2 & 0xFF),
+                (uint8_t)((send_pwm3 >> 8) & 0xFF),       (uint8_t)(send_pwm3 & 0xFF),
             };
             esp_err_t result = esp_now_send(slave.peer_addr, data, sizeof(data));
             return result;
@@ -432,9 +449,9 @@ class Robot {
             static unsigned long last_send_ms = 0;
             unsigned long        ms           = millis();
             if ((long)(ms - last_send_ms) >= 100) {
-                last_send_ms = ms;
-                esp_err_t res =
-                    esp_now.send((int16_t)lround(nowPos.x), (int16_t)lround(nowPos.y), (int16_t)lround(nowPos.theta * 1000.0));
+                last_send_ms  = ms;
+                esp_err_t res = esp_now.send((int16_t)lround(nowPos.x), (int16_t)lround(nowPos.y),
+                                             (int16_t)lround(nowPos.theta * 1000.0), motor_pwm.m1, motor_pwm.m2, motor_pwm.m3);
                 if (res != ESP_OK) {
                     Serial.printf("esp_now_send err=%d\n", res);
                 }
@@ -443,7 +460,7 @@ class Robot {
                 //               omega);
             }
 
-            omni_wheels.move(vx_body, vy_body, omega);
+            motor_pwm = omni_wheels.move(vx_body, vy_body, omega);
         }
 
     private:
@@ -451,6 +468,7 @@ class Robot {
         Odometry&   odometry;
         EspNowSend& esp_now;
         Position    target{0., 0., 0.};
+        pwm         motor_pwm{0, 0, 0};
 
         const double POS_DEADZONE_MM    = 1.0;
         const double THETA_DEADZONE_RAD = 2.0 * PI / 180.0;

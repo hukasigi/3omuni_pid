@@ -11,6 +11,7 @@ class PositionPid {
         double control;
 
         double prev_meas;
+        double prev_error;
         bool   first;
 
         double error;
@@ -18,7 +19,7 @@ class PositionPid {
     public:
         PositionPid(double kp, double ki, double kd, double out_min, double out_max, double integral_min, double integral_max)
             : kp(kp), ki(ki), kd(kd), out_min(out_min), out_max(out_max), integral(0.0), integral_min(integral_min),
-              integral_max(integral_max), control(0.0), prev_meas(0.0), first(true) {}
+              integral_max(integral_max), control(0.0), prev_meas(0.0), prev_error(0.0), first(true) {}
 
         // dt[s]
         double update(double target_pos, double now_pos, double dt) {
@@ -31,12 +32,13 @@ class PositionPid {
 
             double derivative = 0.0;
             if (!first) {
-                const double dMeas = (now_pos - prev_meas) / dt;
-                derivative         = -dMeas;
+                // 誤差の微分を取る（符号は自然）
+                derivative = (error - prev_error) / dt;
             } else {
                 first = false;
             }
-            prev_meas = now_pos;
+            prev_meas  = now_pos;
+            prev_error = error;
 
             control = kp * error + ki * integral + kd * derivative;
             control = constrain(control, out_min, out_max);
@@ -46,9 +48,10 @@ class PositionPid {
         double getError() { return error; }
 
         void reset(double now_pos = 0.0) {
-            integral  = 0.0;
-            control   = 0.0;
-            prev_meas = now_pos;
-            first     = true;
+            integral   = 0.0;
+            control    = 0.0;
+            prev_meas  = now_pos;
+            prev_error = 0.0;
+            first      = true;
         }
 };
