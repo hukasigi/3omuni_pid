@@ -48,9 +48,9 @@ PositionPid x_pos_pid(2., 0., 0.0, -MAX_VX_CMD_MM_S, MAX_VX_CMD_MM_S, -INTEGRAL_
 PositionPid y_pos_pid(2., 0., 0.0, -MAX_VY_CMD_MM_S, MAX_VY_CMD_MM_S, -INTEGRAL_MAX, INTEGRAL_MAX);
 PositionPid theta_pos_pid(2., 0., 0.0, -MAX_OMEGA_CMD_RAD_S, MAX_OMEGA_CMD_RAD_S, -INTEGRAL_MAX, INTEGRAL_MAX);
 
-PositionPid x_speed_pid(0.5, 0.2, 0.0, -PWM_LIMIT, PWM_LIMIT, -INTEGRAL_MAX, INTEGRAL_MAX);
-PositionPid y_speed_pid(0.5, 0.2, 0.0, -PWM_LIMIT, PWM_LIMIT, -INTEGRAL_MAX, INTEGRAL_MAX);
-PositionPid theta_speed_pid(0.5, 0.2, 0.0, -PWM_LIMIT, PWM_LIMIT, -INTEGRAL_MAX, INTEGRAL_MAX);
+PositionPid x_speed_pid(0.3, 5., 0.0, -PWM_LIMIT, PWM_LIMIT, -INTEGRAL_MAX, INTEGRAL_MAX);
+PositionPid y_speed_pid(0.3, 5., 0.0, -PWM_LIMIT, PWM_LIMIT, -INTEGRAL_MAX, INTEGRAL_MAX);
+PositionPid theta_speed_pid(0.3, 5., 0.0, -PWM_LIMIT, PWM_LIMIT, -INTEGRAL_MAX, INTEGRAL_MAX);
 
 // SpeedPID x_speed_pid(0.5, 0.5, 0.0, -MAX_VX_CMD_MM_S, MAX_VX_CMD_MM_S);
 // SpeedPID y_speed_pid(0.5, 0.5, 0.0, -MAX_VY_CMD_MM_S, MAX_VY_CMD_MM_S);
@@ -111,7 +111,7 @@ class Motor {
                 last_dir_ = new_dir;
             }
 
-            int out = constrain(abs(duty), 0, 255);
+            int out = constrain(abs(duty), 0, PWM_LIMIT);
             ledcWrite(pwmCh_, out);
         }
 
@@ -290,10 +290,9 @@ class OmniWheel {
         }
 
     private:
-        Motor&                   motor_;
-        double                   angle_{0.0};
-        double                   gain_{1.0};
-        static constexpr int16_t PWM_LIMIT = 255;
+        Motor& motor_;
+        double angle_{0.0};
+        double gain_{1.0};
 };
 
 class OmniWheels {
