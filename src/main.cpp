@@ -38,19 +38,19 @@ const double COUNTS_PER_MM = (ENC_RESOLUTION * GEAR_RATIO) / (PI * OD_RADIUS * 2
 
 ESP32Encoder enc1, enc2, enc3;
 
-const double      MAX_VX_CMD_MM_S     = 200.0;
-const double      MAX_VY_CMD_MM_S     = 200.0;
-constexpr int16_t PWM_LIMIT           = 255;
-const double      INTEGRAL_MAX        = 10.0;
-const double      MAX_OMEGA_CMD_RAD_S = 2.0; // 角速度上限[rad/s]
+const double  MAX_VX_CMD_MM_S     = 255.0;
+const double  MAX_VY_CMD_MM_S     = 255.0;
+const int16_t PWM_LIMIT           = 255;
+const double  INTEGRAL_MAX        = 10.0;
+const double  MAX_OMEGA_CMD_RAD_S = 1.; // 角速度上限[rad/s]
 
-PositionPid x_pos_pid(2., 0., 0.0, -MAX_VX_CMD_MM_S, MAX_VX_CMD_MM_S, -INTEGRAL_MAX, INTEGRAL_MAX);
-PositionPid y_pos_pid(2., 0., 0.0, -MAX_VY_CMD_MM_S, MAX_VY_CMD_MM_S, -INTEGRAL_MAX, INTEGRAL_MAX);
-PositionPid theta_pos_pid(2., 0., 0.0, -MAX_OMEGA_CMD_RAD_S, MAX_OMEGA_CMD_RAD_S, -INTEGRAL_MAX, INTEGRAL_MAX);
+PositionPid x_pos_pid(1., 0.5, 0.0, -MAX_VX_CMD_MM_S, MAX_VX_CMD_MM_S, -INTEGRAL_MAX, INTEGRAL_MAX);
+PositionPid y_pos_pid(1., 0.5, 0.0, -MAX_VY_CMD_MM_S, MAX_VY_CMD_MM_S, -INTEGRAL_MAX, INTEGRAL_MAX);
+PositionPid theta_pos_pid(0.5, 0., 0.0, -MAX_OMEGA_CMD_RAD_S, MAX_OMEGA_CMD_RAD_S, -INTEGRAL_MAX, INTEGRAL_MAX);
 
-PositionPid x_speed_pid(0.3, 5., 0.0, -PWM_LIMIT, PWM_LIMIT, -INTEGRAL_MAX, INTEGRAL_MAX);
-PositionPid y_speed_pid(0.3, 5., 0.0, -PWM_LIMIT, PWM_LIMIT, -INTEGRAL_MAX, INTEGRAL_MAX);
-PositionPid theta_speed_pid(0.3, 5., 0.0, -PWM_LIMIT, PWM_LIMIT, -INTEGRAL_MAX, INTEGRAL_MAX);
+PositionPid x_speed_pid(0.8, 1., 0.0, -PWM_LIMIT, PWM_LIMIT, -INTEGRAL_MAX, INTEGRAL_MAX);
+PositionPid y_speed_pid(0.8, 1., 0.0, -PWM_LIMIT, PWM_LIMIT, -INTEGRAL_MAX, INTEGRAL_MAX);
+PositionPid theta_speed_pid(0.5, 0.5, 0.0, -PWM_LIMIT, PWM_LIMIT, -INTEGRAL_MAX, INTEGRAL_MAX);
 
 // SpeedPID x_speed_pid(0.5, 0.5, 0.0, -MAX_VX_CMD_MM_S, MAX_VX_CMD_MM_S);
 // SpeedPID y_speed_pid(0.5, 0.5, 0.0, -MAX_VY_CMD_MM_S, MAX_VY_CMD_MM_S);
@@ -245,8 +245,8 @@ class Odometry {
             const double c2 = cos(a2), sn2 = sin(a2);
             const double c3 = cos(a3), sn3 = sin(a3);
 
-            // 回転寄与の符号を working code に合わせる
-            const double k = -ROBOT_TO_ODO_RADIUS;
+            // 右回りが + なので回転寄与の符号を反転
+            const double k = +ROBOT_TO_ODO_RADIUS;
 
             const double A[3][3] = {
                 {c1, sn1, k},
@@ -281,7 +281,8 @@ class OmniWheel {
             : motor_(motor), angle_(angle / 180 * PI), gain_(pwm_gain) {}
 
         int16_t run(double vx_mm_s, double vy_mm_s, double omega_rad_s) {
-            const double u_mm_s = cos(angle_) * vx_mm_s + sin(angle_) * vy_mm_s + ROBOT_TO_WHEEL_RADIUS * omega_rad_s;
+            // 右回りが + の系に合わせて回転寄与の符号を反転
+            const double u_mm_s = cos(angle_) * vx_mm_s + sin(angle_) * vy_mm_s - ROBOT_TO_WHEEL_RADIUS * omega_rad_s;
 
             const int pwm_raw = (int)lround(u_mm_s * gain_);
             int16_t   pwm     = constrain(pwm_raw, -PWM_LIMIT, PWM_LIMIT);
@@ -314,7 +315,7 @@ class OmniWheels {
         pwm        pwm_out_{0, 0, 0};
 };
 
-class EspNowSend {
+class DataSend {
     public:
         void begin() {
             WiFi.mode(WIFI_STA);
@@ -384,7 +385,7 @@ class EspNowSend {
 
 class Robot {
     public:
-        Robot(OmniWheels& wheels, Odometry& odo, EspNowSend& esp_now) : omni_wheels(wheels), odometry(odo), esp_now(esp_now) {}
+        Robot(OmniWheels& wheels, Odometry& odo, DataSend& esp_now) : omni_wheels(wheels), odometry(odo), esp_now(esp_now) {}
 
         void set_target(Position position) { target = position; }
 
@@ -400,10 +401,29 @@ class Robot {
             target.y     = (double)cy;
             target.theta = WrapPi((double)cth / 1000.0);
 
+            // 新しい指令か判定（これが来た時だけ再開）
+            const bool cmd_changed = (!cmd_initialized_) || (fabs(target.x - cmd_x_mm_) > 0.5) ||
+                                     (fabs(target.y - cmd_y_mm_) > 0.5) ||
+                                     (fabs(WrapPi(target.theta - cmd_theta_rad_)) > (1.0 * PI / 180.0));
+
+            if (cmd_changed) {
+                cmd_initialized_         = true;
+                cmd_x_mm_                = target.x;
+                cmd_y_mm_                = target.y;
+                cmd_theta_rad_           = target.theta;
+                stopped_                 = false;
+                stop_candidate_since_ms_ = 0;
+                x_pos_pid.reset();
+                y_pos_pid.reset();
+                theta_pos_pid.reset();
+                x_speed_pid.reset();
+                y_speed_pid.reset();
+                theta_speed_pid.reset();
+            }
+
             const Position nowPos = odometry.get_position();
             const Position nowVel = odometry.get_velocity();
 
-            // body -> world に変換して速度計測を一致させる
             const double ct           = cos(nowPos.theta);
             const double st           = sin(nowPos.theta);
             const double now_vx_world = ct * nowVel.x - st * nowVel.y;
@@ -414,36 +434,46 @@ class Robot {
             const double dist_err = hypot(ex, ey);
             const double th_err   = WrapPi(target.theta - nowPos.theta);
 
-            double vx_target    = 0;
-            double vy_target    = 0;
-            double omega_target = 0;
+            const bool stop_condition = (dist_err < POS_DEADZONE_MM) && (fabs(th_err) < THETA_STOP_RAD) &&
+                                        (fabs(nowVel.theta) < OMEGA_STOP_RAD_S) && (hypot(nowVel.x, nowVel.y) < V_STOP_MM_S);
 
-            double vx_world = 0;
-            double vy_world = 0;
-            double omega    = 0;
+            // stopped_中は「同じ指令では再開しない」
+            if (!stopped_) {
+                if (stop_condition) {
+                    if (!stop_candidate_since_ms_) stop_candidate_since_ms_ = millis();
+                    if (millis() - stop_candidate_since_ms_ >= 500) {
+                        stopped_ = true;
+                    }
+                } else {
+                    stop_candidate_since_ms_ = 0;
+                }
+            }
 
-            const bool in_deadzone = (dist_err < POS_DEADZONE_MM) && (fabs(th_err) < THETA_DEADZONE_RAD);
+            double vx_body = 0.0;
+            double vy_body = 0.0;
+            double omega   = 0.0;
 
-            if (in_deadzone) {
+            if (!stopped_) {
+                const double vx_target    = x_pos_pid.update(target.x, nowPos.x, dt);
+                const double vy_target    = y_pos_pid.update(target.y, nowPos.y, dt);
+                const double omega_target = theta_pos_pid.update(target.theta, nowPos.theta, dt);
+
+                const double vx_world = x_speed_pid.update(vx_target, now_vx_world, dt);
+                const double vy_world = y_speed_pid.update(vy_target, now_vy_world, dt);
+                omega                 = theta_speed_pid.update(omega_target, nowVel.theta, dt);
+
+                vx_body = ct * vx_world + st * vy_world;
+                vy_body = -st * vx_world + ct * vy_world;
+            } else {
                 x_pos_pid.reset();
                 y_pos_pid.reset();
                 theta_pos_pid.reset();
                 x_speed_pid.reset();
                 y_speed_pid.reset();
                 theta_speed_pid.reset();
-
-            } else {
-                vx_target    = x_pos_pid.update(target.x, nowPos.x, dt);
-                vy_target    = y_pos_pid.update(target.y, nowPos.y, dt);
-                omega_target = theta_pos_pid.update(target.theta, nowPos.theta, dt);
-
-                vx_world = x_speed_pid.update(vx_target, now_vx_world, dt);
-                vy_world = y_speed_pid.update(vy_target, now_vy_world, dt);
-                omega    = theta_speed_pid.update(omega_target, nowVel.theta, dt);
             }
 
-            const double vx_body = ct * vx_world + st * vy_world;
-            const double vy_body = -st * vx_world + ct * vy_world;
+            motor_pwm = omni_wheels.move(vx_body, vy_body, omega);
 
             static unsigned long last_send_ms = 0;
             unsigned long        ms           = millis();
@@ -454,23 +484,28 @@ class Robot {
                 if (res != ESP_OK) {
                     Serial.printf("esp_now_send err=%d\n", res);
                 }
-                // Serial.printf("x:%f y:%f th:%f x_t%f y_t%f omega_t%f\r\n", nowPos.x, nowPos.y, nowPos.theta, vx_world,
-                // vy_world,
-                //               omega);
             }
-
-            motor_pwm = omni_wheels.move(vx_body, vy_body, omega);
         }
 
     private:
         OmniWheels& omni_wheels;
         Odometry&   odometry;
-        EspNowSend& esp_now;
+        DataSend&   esp_now;
         Position    target{0., 0., 0.};
         pwm         motor_pwm{0, 0, 0};
+        bool        stopped_{false};
 
-        const double POS_DEADZONE_MM    = 1.0;
-        const double THETA_DEADZONE_RAD = 2.0 * PI / 180.0;
+        const double  POS_DEADZONE_MM   = 1.0;
+        const double  THETA_STOP_RAD    = 2.0 * PI / 180.0;
+        const double  THETA_RELEASE_RAD = 5.0 * PI / 180.0;
+        const double  OMEGA_STOP_RAD_S  = 0.05;
+        const double  V_STOP_MM_S       = 1.0;
+        unsigned long stop_candidate_since_ms_{0};
+
+        bool   cmd_initialized_{false};
+        double cmd_x_mm_{0.0};
+        double cmd_y_mm_{0.0};
+        double cmd_theta_rad_{0.0};
 };
 
 Motor m1(PIN_DIR_1, PIN_PWM_1, W1_CH, W1_SIGN);
@@ -485,7 +520,7 @@ OmniWheel w3(m3, W3_ANGLE);
 
 OmniWheels omuni(w1, w2, w3);
 
-EspNowSend esp_now;
+DataSend esp_now;
 
 Robot robot(omuni, odometry, esp_now);
 
